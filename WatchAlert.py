@@ -1,157 +1,184 @@
-#! /usr/bin/python
-
+import argparse  # import for command line parse
+import csv
 import datetime  # import for timestamp
-import getopt, sys  # import for passing command line options
-import smtplib  # import for connecting to mail server
+import os  # import for environment variables
 import time  # import for sleep
-import urllib
-import urllib2  # import for extracting http
-import yaml
-import os
+import yaml  # import for config files
+
+import requests
+from lxml import html
+
+import smtplib  # import for connecting to mail server
 from email.mime.text import MIMEText  # import for creating mail
 
-# ################
-##### notes #####
-#################
 
-#this script scrapes and searches website html for keywords, and then emails the hits to specified user(s)
-#default run -- scrapes wus-forum and searches 'halios'; refresh every 15 minutes
-#submariner run -- WatchAlert.py -s submariner
+class WatchAlerter(object):
+    """
+    Scrapes and searches WUS Forum for keywords, emails the matches to specified user(s)
+    CONFIG -- Set environment variables (in ~/.bash_profile) for sensitive info -- email settings
+    USAGE: WatchAlert.py [-h] [-s SEARCH] [-r RECIPIENT] [-u URL] [-c]
 
-#to-do
-#1. add functionality of searching multiple keywords, in an array
+        optional arguments:
+          -h, --help            show this help message and exit
+          -s SEARCH, --search SEARCH
+                                search keyword
+          -r RECIPIENT, --recipient RECIPIENT
+                                recipient for email alerts; must be individually declared
+          -u URL, --url URL     url to scrape (under development)
+          -c, --continuous      continuously run the script
 
-########################
-###### scrapes wus #####
-########################
+        Default -- WatchAlert.py -- Scrapes wus-forum and searches 'halios'
+    """
 
+    def __init__(self, websites='http://forums.watchuseek.com/f29/', search_keywords='halios'):
+        with open("WatchAlert.yaml", 'r') as configfile:
+            self.config = yaml.load(configfile)
+        self.email_host = os.environ[self.config["email_host_origin"]]
+        self.email_user = os.environ[self.config["email_user_origin"]]
+        self.email_passwd = os.environ[self.config["email_passwd_origin"]]
 
+        parser = argparse.ArgumentParser()
+        parser.add_argument("-s", "--search", help="search keyword")
+        parser.add_argument("-r", "--recipient", help="recipient for email alerts; must be individually declared", action="append")
+        parser.add_argument("-u", "--url", help="url to scrape (under development)")
+        parser.add_argument("-c", "--continuous", help="continuously run the script", action="store_true")
+        args = parser.parse_args()
 
-def scrape(scrapesite, scrapefile="scrapefile.html"):
-    #opens temporary file for editing
-    wus = open(scrapefile, 'wb')
+        if args.search:
+            self.search_keywords = args.search.lower()
+        else:
+            self.search_keywords = search_keywords.lower()
 
-    #opens and saves current frontpage
-    response = urllib2.urlopen(scrapesite)
-    html = response.read()
-    wus.write(html)
-    wus.close()
+        if args.recipient:
+            self.email_recipients = [args.recipient]
+        else:
+            self.email_recipients = [os.environ[self.config["email_user_origin"]]]
 
+        if args.url:
+            pass#self.websites = args.url
+        else:
+            self.websites = websites
 
-########################
-##### searches wus #####
-########################
+        if args.continuous:
+            self.refresh = 15 * 60
 
+        self.now = str(datetime.datetime.now())
+        self.database = "WatchDatabase.csv"
+        self.column_names = ["keyword_match", "title_description", "source", "member_posted", "date_posted", "date_recorded"]
 
-def search(keywords, scrapefile='scrapefile.html', msgfile='msgfile.html', switch=False):
-    #searches downloaded wus for keywords, checks the line against the keyword "database", and adds them to email file
-    wus = open(scrapefile, 'rb')
-    email = open(msgfile, 'wb')
-    database = open(keywords, 'ab')
-    for line in wus:
-        if keywords in line and 'class=\"title"' in line:  #searches keyword & makes sure each hit is a class="title" post
-            if checkdatabase(line, keywords) != 0:
-                email.write(line)
-                database.write(line)
-                email.write("<br>")  #formats email with extra linebreaks for easier viewing
-                switch = True
-    wus.close()
+    def __call__(self, *args, **kwargs):
+        self.display_options()
+        while 1:
+            watches = self.scrape()
+            email_update = self.search(watches)
+            if email_update:
+                self.send_email(email_update)
+            else:
+                print "No new matches", str(datetime.datetime.now())
+            try:
+                time.sleep(self.refresh)
+            except AttributeError:
+                break
 
-    #add timestamp to email file
-    now = datetime.datetime.now()
-    email.write(str(now))
-    email.close()
-
-    return switch
-
-
-##########################
-##### check database #####
-##########################
-
-
-def checkdatabase(wusline, keywords):
-    #checks database for already viewed hits
-    database = open(keywords, 'rb')
-    for line in database:
-        if line == wusline:
-            return 0  #returns 0 if the line is already present in database
-
-
-##########################
-##### emails updates #####
-##########################
-
-
-def email(keywords, recipient, switch=False, msgfile='msgfile.html'):
-    #server settings
-    host = os.environ[config["email_host_origin"]]
-    user = os.environ[config["email_user_origin"]]
-    passwd = os.environ[config["email_passwd_origin"]]
-
-    #assemble email
-    email = open(msgfile, 'rb')
-    msg = MIMEText(email.read(), 'html')
-    msg['Subject'] = "[WUS] " + keywords + " " + str(datetime.datetime.now())
-    msg['From'] = user
-    msg['To'] = user
-
-    #connect to server and send email
-    if switch == True:
+    def display_options(self):
+        print "Search site:", self.websites
+        print "Search keywords:", self.search_keywords
+        print "Notify: ", self.email_recipients
         try:
-            server = smtplib.SMTP(host, 587)
+            print " ".join(["Refresh rate:", str(self.refresh), "seconds"])
+        except AttributeError:
+            print " ".join(["Refresh rate: None"])
+
+    def scrape(self):
+        """
+        Scrapes targeted website; build item dictionary
+        IN: N/A
+        OUT: list of scraped values
+        """
+        r = requests.get(self.websites)
+        tree = html.fromstring(r.text)
+        scraped_items = []
+        title_description = tree.xpath('//a[starts-with(@class, "title")]/text()')
+        title_description = [x.lower() for x in title_description]
+        source = tree.xpath('//a[starts-with(@class, "title")]/@href')
+        member_posted = tree.xpath('//div[@class="author"]/span[@class="label"]/a/text()')
+        date_posted = tree.xpath('//div[@class="author"]/span[@class="label"]/a/@title')
+        keyword_match = [self.search_keywords for _ in title_description]
+        date_recorded = [self.now for _ in title_description]
+        column_values = [keyword_match, title_description, source, member_posted, date_posted, date_recorded]
+
+        for index in xrange(len(title_description)):
+            scraped_items.append({c: column_values[i][index] for i, c in enumerate(self.column_names)})
+
+        return scraped_items
+
+    def search(self, recent_posts):
+        """
+        Searches recent postings for keywords; checks each line against the database; adds new matches to email file
+        IN: list of recent posts from site
+        OUT: list of new matches if available
+        """
+        email_msg = []
+        new_matches = []
+        for post in recent_posts:
+            if self.search_keywords in post['title_description']:
+                if self.check_database(post['title_description']):
+                    email_msg.extend([post["title_description"], "\n", post["source"], "\n\n"])
+                    new_matches.append(post)
+
+        if email_msg:
+            email_msg.extend(["\n", self.now])
+
+        if new_matches:
+            with open(self.database, 'ab') as db:
+                writer = csv.writer(db)
+                for match in new_matches:
+                    insert_match = [match[column] for column in self.column_names]
+                    writer.writerows([insert_match])
+
+        return email_msg
+
+    def check_database(self, title_description):
+        """
+        Checks database for already seen title_description; creates database if unavailable
+        IN: match from site
+        OUT: returns True for new match
+        """
+        try:
+            with open(self.database, 'rb') as csv_file:
+                reader = csv.reader(csv_file)
+                for row in reader:
+                    if row[1] == title_description:
+                        return False
+                return True
+        except IOError:
+            with open(self.database, 'wb') as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerows([self.column_names])
+                return True
+
+    def send_email(self, contents):
+        """
+        Assemble and send email alert
+        IN: list of new matches
+        OUT: N/A
+        """
+        contents_string = " ".join(contents)
+        msg = MIMEText(contents_string, 'plain')
+        msg['Subject'] = " ".join(["[WUS]", self.search_keywords, self.now])
+        msg['From'] = self.email_user
+        msg['To'] = ", ".join(self.email_recipients)
+
+        try:
+            server = smtplib.SMTP(self.email_host, 587)
             server.starttls()
-            server.login(user, passwd)
-            server.sendmail(user, recipient, msg.as_string())
+            server.login(self.email_user, self.email_passwd)
+            server.sendmail(self.email_user, self.email_recipients, msg.as_string())
             server.quit()
+            print "Email sent", str(datetime.datetime.now())
         except:
             print "Email failure", str(datetime.datetime.now())
-        else:
-            print "Email sent", str(datetime.datetime.now())
-    else:
-        print "No new matches", str(datetime.datetime.now())
 
-    email.close()
-
-####################################
-##### global default variables #####
-####################################
-
-refresh = 15 * 60
-keywords = 'halios'
-url = 'http://forums.watchuseek.com/f29/'
-url_beta = 'http://forums.timezone.com/index.php?t=threadt&frm_id=32'
-cycle = 1
-recipient = [os.environ[config["email_user_origin"]]]
-yamlfile = "WatchAlert.yaml"
-with open(yamlfile, 'r') as configfile:
-    config = yaml.load(configfile)
-
-###############################
-##### parse command line ######
-###############################
-
-options, remainder = getopt.getopt(sys.argv[1:], 'r:s:u:')
-
-for opt, arg in options:
-    if opt in ('-s'):  #specify search terms
-        keywords = arg
-    if opt in ('-r'):  #specify additional recipients
-        recipient.append(arg)
-    elif opt in ('-u'):  #specify url to scrape
-        url = arg
-
-while __name__ == "__main__":
-    print os.environ[config["email_host_origin"]]
-    print os.environ[config["email_user_origin"]]
-    print os.environ[config["email_passwd_origin"]]
-    #print "Cycle:", cycle
-    #print "Refresh rate:", refresh, "seconds"
-    #print "Search keywords:", keywords
-    #print "Search site:", url
-    #print "Notify: ", recipient
-    #scrape(url)
-    #switch = search(keywords)
-    #email(keywords, recipient, switch)
-    #cycle = cycle + 1
-    time.sleep(refresh)
+if __name__ == "__main__":
+    w = WatchAlerter()
+    w()
