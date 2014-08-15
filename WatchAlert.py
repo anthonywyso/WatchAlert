@@ -1,140 +1,96 @@
 import argparse  # import for command line parse
 import csv
-import datetime  # import for timestamp
+from datetime import datetime, timedelta  # import for timestamp
 import os  # import for environment variables
 import time  # import for sleep
 import yaml  # import for config files
-
-import requests
-from lxml import html
+from collections import defaultdict
 
 import smtplib  # import for connecting to mail server
 from email.mime.text import MIMEText  # import for creating mail
+from parsers import WUSParser, BOCParser, CLParser, SDParser
 
 
 class WatchAlerter(object):
     """
-    Scrapes and searches WUS Forum for keywords, emails the matches to specified user(s)
+    Scrapes and searches sites for keywords, emails the matches to specified user(s)
     CONFIG -- Set environment variables (in ~/.bash_profile) for sensitive info -- email settings
-    USAGE: WatchAlert.py [-h] [-s SEARCH] [-r RECIPIENT] [-u URL] [-c]
+    USAGE: watchalert.py [-h] [-s SEARCH] [-r RECIPIENT] [-u URL] [-c]
 
         optional arguments:
           -h, --help            show this help message and exit
-          -s SEARCH, --search SEARCH
-                                search keyword
+          -k KEYWORD, --keyword KEYWORD
+                                keyword search
           -r RECIPIENT, --recipient RECIPIENT
                                 recipient for email alerts; must be individually declared
-          -u URL, --url URL     url to scrape (under development)
+          -s SOURCE, --source SOURCE     source site to scrape (under development)
           -c, --continuous      continuously run the script
-
-        Default -- WatchAlert.py -- Scrapes wus-forum and searches 'halios'
     """
 
-    def __init__(self, websites='http://forums.watchuseek.com/f29/', search_keywords='halios'):
-        with open("WatchAlert.yaml", 'r') as configfile:
+    def __init__(self, settings):
+        with open("watchalert.yaml", 'r') as configfile:
             self.config = yaml.load(configfile)
         self.email_host = os.environ[self.config["email_host_origin"]]
         self.email_user = os.environ[self.config["email_user_origin"]]
         self.email_passwd = os.environ[self.config["email_passwd_origin"]]
 
-        parser = argparse.ArgumentParser()
-        parser.add_argument("-s", "--search", help="search keyword")
-        parser.add_argument("-r", "--recipient", help="recipient for email alerts; must be individually declared", action="append")
-        parser.add_argument("-u", "--url", help="url to scrape (under development)")
-        parser.add_argument("-c", "--continuous", help="continuously run the script", action="store_true")
-        args = parser.parse_args()
+        self.source = settings['source']
+        self.recipients = settings['recipient']
+        self.keywords = settings['keyword'].lower()
+        self.refresh = settings['refresh']
 
-        if args.search:
-            self.search_keywords = args.search.lower()
-        else:
-            self.search_keywords = search_keywords.lower()
-
-        if args.recipient:
-            self.email_recipients = [args.recipient]
-        else:
-            self.email_recipients = [os.environ[self.config["email_user_origin"]]]
-
-        if args.url:
-            pass#self.websites = args.url
-        else:
-            self.websites = websites
-
-        if args.continuous:
-            self.refresh = 15 * 60
-
-        self.now = str(datetime.datetime.now())
-        self.database = "WatchDatabase.csv"
+        self.now = str(datetime.now().strftime('%Y-%m-%d %H:%M'))
+        self.database = "database.csv"
         self.column_names = ["keyword_match", "title_description", "source", "member_posted", "date_posted", "date_recorded"]
+        self.source_parsers = {'wus': WUSParser, 'boc': BOCParser, 'sd': SDParser, 'cl': CLParser, 'clsf': CLParser}
 
-    def __call__(self, *args, **kwargs):
-        self.display_options()
-        while 1:
-            watches = self.scrape()
-            email_update = self.search(watches)
-            if email_update:
-                self.send_email(email_update)
-            else:
-                print "No new matches", str(datetime.datetime.now())
-            try:
-                time.sleep(self.refresh)
-            except AttributeError:
-                break
+    def track(self):
+        items = self.scrape()
+        email_update = self.search(items)
+        if email_update:
+            self.send_email(email_update)
+        else:
+            print ">Result: No new matches"
+        print "Cycle complete:", self.now, "\n"
 
-    def display_options(self):
-        print "Search site:", self.websites
-        print "Search keywords:", self.search_keywords
-        print "Notify: ", self.email_recipients
-        try:
+        if self.refresh:
+            time.sleep(self.refresh)
+            self.now = str(datetime.now())
+            self.track()
+
+    def display_settings(self):
+        print "Search site:", self.source
+        print "Search keywords:", self.keywords
+        print "Notify: ", self.recipients
+        if self.refresh:
             print " ".join(["Refresh rate:", str(self.refresh), "seconds"])
-        except AttributeError:
-            print " ".join(["Refresh rate: None"])
 
     def scrape(self):
-        """
-        Scrapes targeted website; build item dictionary
-        IN: N/A
-        OUT: list of scraped values
-        """
-        r = requests.get(self.websites)
-        tree = html.fromstring(r.text)
-        scraped_items = []
-        title_description = tree.xpath('//a[starts-with(@class, "title")]/text()')
-        title_description = [x.lower() for x in title_description]
-        source = tree.xpath('//a[starts-with(@class, "title")]/@href')
-        member_posted = tree.xpath('//div[@class="author"]/span[@class="label"]/a/text()')
-        date_posted = tree.xpath('//div[@class="author"]/span[@class="label"]/a/@title')
-        keyword_match = [self.search_keywords for _ in title_description]
-        date_recorded = [self.now for _ in title_description]
-        column_values = [keyword_match, title_description, source, member_posted, date_posted, date_recorded]
-
-        for index in xrange(len(title_description)):
-            scraped_items.append({c: column_values[i][index] for i, c in enumerate(self.column_names)})
-
-        return scraped_items
+        p = self.source_parsers[self.source](self.source)
+        s = p.get_tree()
+        return p.parse_tree(s)
 
     def search(self, recent_posts):
         """
-        Searches recent postings for keywords; checks each line against the database; adds new matches to email file
+        Searches recent postings for keywords; checks each line against the database; adds new matches to email body
         IN: list of recent posts from site
         OUT: list of new matches if available
         """
         email_msg = []
         new_matches = []
         for post in recent_posts:
-            if self.search_keywords in post['title_description']:
+            if self.keywords in post['title_description']:
                 if self.check_database(post['title_description']):
                     email_msg.extend([post["title_description"], "\n", post["source"], "\n\n"])
                     new_matches.append(post)
 
-        if email_msg:
-            email_msg.extend(["\n", self.now])
-
         if new_matches:
             with open(self.database, 'ab') as db:
-                writer = csv.writer(db)
+                writer = csv.DictWriter(db, delimiter=',', fieldnames=self.column_names)
                 for match in new_matches:
-                    insert_match = [match[column] for column in self.column_names]
-                    writer.writerows([insert_match])
+                    match['keyword_match'] = self.keywords
+                    match['date_recorded'] = self.now
+                    writer.writerow(match)
 
         return email_msg
 
@@ -142,19 +98,19 @@ class WatchAlerter(object):
         """
         Checks database for already seen title_description; creates database if unavailable
         IN: match from site
-        OUT: returns True for new match
+        OUT: returns True for new match, False for duplicate match
         """
         try:
-            with open(self.database, 'rb') as csv_file:
-                reader = csv.reader(csv_file)
+            with open(self.database, 'rb') as db:
+                reader = csv.DictReader(db)
                 for row in reader:
-                    if row[1] == title_description:
+                    if row['title_description'] == title_description:
                         return False
                 return True
         except IOError:
-            with open(self.database, 'wb') as csv_file:
-                writer = csv.writer(csv_file)
-                writer.writerows([self.column_names])
+            with open(self.database, 'wb') as db:
+                writer = csv.DictWriter(db, delimiter=',', fieldnames=self.column_names)
+                writer.writeheader()
                 return True
 
     def send_email(self, contents):
@@ -163,22 +119,41 @@ class WatchAlerter(object):
         IN: list of new matches
         OUT: N/A
         """
+        contents.extend(["\n", self.now])  #adds timestamp to email content
         contents_string = " ".join(contents)
         msg = MIMEText(contents_string, 'plain')
-        msg['Subject'] = " ".join(["[WUS]", self.search_keywords, self.now])
+        msg['Subject'] = " ".join(["[", self.source, "]", self.keywords, self.now])
         msg['From'] = self.email_user
-        msg['To'] = ", ".join(self.email_recipients)
+        msg['To'] = ", ".join(self.recipients)
 
-        try:
-            server = smtplib.SMTP(self.email_host, 587)
-            server.starttls()
-            server.login(self.email_user, self.email_passwd)
-            server.sendmail(self.email_user, self.email_recipients, msg.as_string())
-            server.quit()
-            print "Email sent", str(datetime.datetime.now())
-        except:
-            print "Email failure", str(datetime.datetime.now())
+        server = smtplib.SMTP(self.email_host, 587)
+        server.starttls()
+        server.login(self.email_user, self.email_passwd)
+        server.sendmail(self.email_user, self.recipients, msg.as_string())
+        server.quit()
+        print ">>>Result: Email sent"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-k", "--keyword", help="keyword search", required=True)
+    parser.add_argument("-r", "--recipient", help="recipient for email alerts; must be individually declared", action="append")
+    parser.add_argument("-s", "--source", help="source site to scrape (wus,boc,ebay,cl,sd)", required=True)
+    parser.add_argument("-c", "--continuous", help="continuously run the script", action="store_true")
+    args = parser.parse_args()
+
+    inputs = defaultdict(list)
+    inputs['keyword'] = args.keyword
+    inputs['recipient'] = args.recipient
+    inputs['source'] = args.source
+    if args.continuous:
+        inputs['refresh'] = 15 * 60
+
+    return inputs
+
 
 if __name__ == "__main__":
-    w = WatchAlerter()
-    w()
+    settings = parse_args()
+    w = WatchAlerter(settings)
+    w.display_settings()
+    w.track()
