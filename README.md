@@ -1,4 +1,4 @@
 WatchAlert
 ==========
 
-Email alerts for wrist watch classifieds
+Watch classified sites and send email alerts for matches
