@@ -44,6 +44,15 @@ class WatchAlerter(object):
         self.column_names = ["keyword_match", "title_description", "source", "member_posted", "date_posted", "date_recorded"]
         self.source_parsers = {'wus': WUSParser, 'boc': BOCParser, 'sd': SDParser, 'cl': CLParser, 'clsf': CLParser}
 
+    def __repr__(self):
+        d_so = " ".join(["Search site:", self.source, "\n"])
+        d_key = " ".join(["Search keywords:", self.keywords, "\n"])
+        d_mail = " ".join(["Notify: ", " ".join(self.recipients), "\n"])
+        if self.refresh:
+            d_rate = " ".join(["Refresh rate:", str(self.refresh), "seconds\n"])
+            return 'WatchAlerter:\n %s %s %s %s' % (d_so, d_key, d_mail, d_rate)
+        return 'WatchAlerter:\n %s %s %s' % (d_so, d_key, d_mail)
+
     def track(self):
         items = self.scrape()
         email_update = self.search(items)
@@ -55,15 +64,8 @@ class WatchAlerter(object):
 
         if self.refresh:
             time.sleep(self.refresh)
-            self.now = str(datetime.now())
+            self.now = str(datetime.now().strftime('%Y-%m-%d %H:%M'))
             self.track()
-
-    def display_settings(self):
-        print "Search site:", self.source
-        print "Search keywords:", self.keywords
-        print "Notify: ", self.recipients
-        if self.refresh:
-            print " ".join(["Refresh rate:", str(self.refresh), "seconds"])
 
     def scrape(self):
         p = self.source_parsers[self.source](self.source)
@@ -155,5 +157,5 @@ def parse_args():
 if __name__ == "__main__":
     settings = parse_args()
     w = WatchAlerter(settings)
-    w.display_settings()
+    print w
     w.track()
